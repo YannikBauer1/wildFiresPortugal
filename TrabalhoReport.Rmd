@@ -1,0 +1,558 @@
+---
+title: "Wild Fires - Practical Assignment"
+output: html_notebook
+author: "Sofia Malpique & Yannik Bauer"
+---
+
+# Introduction
+
+##### In the practical assignment we had the opportunity to get to know better some of the data mining tasks such as data cleaning, pre-processing, exploratory analysis, which includes data visualization and, at last, predictive modelling.
+
+##### It was our job to combine different data-sets containing relevant information about wild fires in Portugal in order to come up with a machine learning model that would tell us if a certain fire was intentional or unintentional.
+
+##### This report contains all the steps we took, our source code and, also, some comments to help follow our thinking.
+
+<br/>
+
+##### First, we should load all the necessary libraries:
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(dlookr)
+library(rnoaa)
+library(lubridate)
+require(devtools)
+library(zoo)
+library(data.table)
+library(ggplot2)
+library(cluster)
+library(fpc)
+library(factoextra)
+library(caret)
+library(naivebayes)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(e1071)
+library(nnet)
+library(neuralnet)
+library(caret)
+library(performanceEstimation)
+```
+
+# Data importing, cleaning and pre-processing
+
+```{r}
+fires_train <- read_csv("fires_train.csv", na=c("-","NA"))
+```
+
+<br/>
+
+##### Given that no data related to temperature was available in our main data-set, we decided that it would be relevant and so, we imported it from another data-set.
+
+```{r}
+load("station_data.Rdata")
+```
+
+<br/>
+
+##### We are only interested in the main-land of Portugal, that's why Azores and Madeira are not accounted. So we restrained to the coordinates of Portugal. Also, we have element == "TMAX", because we are interested in using the maximum temperature registered on that day; and we select "id" and "name" because nothing else is relevant.
+
+##### We only want one temperature per district, so we removed "COIMBRA/CERNACHE" and "TAVIRA".
+
+```{r}
+station_data <- station_data %>% 
+  filter(str_starts(id,"PO"), latitude < 42.2, latitude > 36.8, 
+         longitude > -9.6,longitude < -6.1, element=="TMAX") %>% 
+  select(id,name) %>% 
+  filter(name!="COIMBRA/CERNACHE",name!="TAVIRA")
+```
+
+<br/>
+
+##### We restrained the dates - we're only interested in 2014 and 2015.
+##### We maintain "id" so we are able to join tables later.
+##### We sort first by id and then by date to fill the missing values for "tmax".
+
+```{r}
+weather_data <- ghcnd_search(station_data$id, var = c("TMAX"), 
+                             date_min = "2014-01-01", date_max = "2015-12-31")
+
+weather_data <- weather_data$tmax %>% 
+  select(id,tmax,date) %>% 
+  arrange(id,date) %>% 
+  fill(tmax)
+```
+
+<br/>
+
+##### We want to find out which stations in Portugal have data on tmax
+##### As we don't have all the Portugal's districts in "station_data" we need to add/create a column called "nearest_district" containing the districts available in "weather_data".
+##### With this we can put the values of maximum temperature to districts that don't appear in "weather_data" using the values of the nearest district.
+
+```{r}
+merge(weather_data,station_data,"id") %>% distinct(id, .keep_all = TRUE) %>%
+  select(id,name)
+```
+
+
+```{r}
+station_data <- station_data %>% 
+  mutate(nearest_district=c("Lisboa","Porto","Coimbra","Beja","Bragança","Faro",
+                            "Évora","Castelo Branco")) %>%
+  add_row(nearest_district="Viseu",id="PO000008575")  %>% 
+  add_row(nearest_district="Aveiro",id="PO000008575") %>% 
+  add_row(nearest_district="Braga",id="PO000008575")  %>% 
+  add_row(nearest_district="Viana do Castelo",id="PO000008575") %>% 
+  add_row(nearest_district="Vila Real",id="PO000008575") %>% 
+  add_row(nearest_district="Guarda",id="POM00008570") %>% 
+  add_row(nearest_district="Leiria",id="PO000008535") %>% 
+  add_row(nearest_district="Santarém",id="PO000008535") %>% 
+  add_row(nearest_district="Portalegre",id="POM00008558") %>% 
+  add_row(nearest_district="Setúbal",id="PO000008535")
+station_data$id[2] <- "PO000008575"
+station_data$id[3] <- "POM00008570"
+station_data$id[4] <- "POM00008558"
+```
+
+<br/>
+
+
+```{r}
+temp_data <- merge(station_data,weather_data,"id",all.x = TRUE) %>% 
+  as_tibble(.) %>% 
+  select(nearest_district,tmax,date) %>% 
+  rename(district=nearest_district) %>% 
+  mutate(tmax= (tmax/10))
+```
+
+<br/>
+
+### Data understanding and analysis
+
+```{r}
+fires_train
+summary(fires_train)
+spec(fires_train)
+fires_train %>% find_na(index=FALSE)
+fires_train %>% select(find_na(.)) %>% diagnose()
+unique(select(fires_train,district))
+```
+
+
+<br/>
+
+##### We have created a data_preprocessing function that takes out irrelevant features (from our point of view), such has attributes that only have NA's, that are linear combinations from other attributes, etc...
+##### This function corrects the two instances of Viana do Castelo (that were differently written), converts attributes' types into other types accordingly to what is more relevant and does the necessary merges.
+##### Creates new columns that we believe that can contribute better to the prediction task.
+
+```{r}
+getSeason <- function(DATES) {
+  WS <- as.Date("2012-12-21", format = "%Y-%m-%d") # Winter Solstice
+  SE <- as.Date("2012-3-21",  format = "%Y-%m-%d") # Spring Equinox
+  SS <- as.Date("2012-6-21",  format = "%Y-%m-%d") # Summer Solstice
+  FE <- as.Date("2012-9-23",  format = "%Y-%m-%d") # Fall Equinox
+  
+  # Convert dates from any year to 2012 dates
+  d <- as.Date(strftime(DATES, format="2012-%m-%d"))
+  
+  ifelse (d >= WS | d < SE, "Winter",
+          ifelse (d >= SE & d < SS, "Spring",
+                  ifelse (d >= SS & d < FE, "Summer", "Fall")))
+}
+
+
+data_preprocessing <- function(dataset){
+  dataset <- dataset %>% 
+    select(-c(municipality,parish,alert_source,lat,lon,region,
+              firstInterv_date,firstInterv_hour,total_area,village_veget_area,
+              extinction_date,extinction_hour)) %>% 
+    mutate(district=replace(district,
+                            district=="Viana Do Castelo","Viana do Castelo")) %>% 
+    mutate(alert_date=as.Date(alert_date)) %>% 
+    mutate(date=alert_date) %>% 
+    merge(temp_data,.,c("district","date"), all.y = TRUE) %>%
+    as_tibble(.)
+  dataset %>% find_na(index=FALSE)
+  help <- dataset %>% subset(is.na(tmax)) %>% 
+    select(district,date,tmax)
+  temp_data <- temp_data %>% add_row(help) %>% 
+    arrange(district,date) %>% 
+    fill(tmax) %>%
+    unique(.)
+  dataset <- dataset %>% 
+    select(-c(tmax)) %>%
+    merge(temp_data,.,c("district","date")) %>%
+    as_tibble(.) %>% 
+    rename(season = date) %>%
+    mutate(season = getSeason(season), weekday = as.factor(weekdays(alert_date))) %>%
+    mutate(weekday = ordered(weekday, levels=c("Monday","Tuesday","Wednesday",
+                                               "Thursday","Friday","Saturday","Sunday")))
+  litoral <- c("Viana do Castelo","Braga","Porto","Aveiro","Coimbra","Leiria",
+               "Lisboa","Setúbal","Faro")
+  time <- as.POSIXct(strptime(dataset$alert_hour,"%H:%M:%S"),"UTC")
+  x=as.POSIXct(strptime(c("000000","060000","120000","180000","235959"),"%H%M%S"),
+               "UTC")
+  labs=c("dawn","morning","afternoon","night")
+  dataset <- dataset %>% 
+    mutate(inLitoral=ifelse(district %in% litoral, 1,0),
+           timeOfDay=labs[findInterval(time,x)])
+  return(dataset)
+}
+```
+
+```{r}
+fires_train <- data_preprocessing(fires_train) %>% 
+  mutate(intentional_cause=as.factor(intentional_cause))
+```
+
+
+# Data exploratory analysis
+
+### How many intentional and non intentional fires do we have?
+
+```{r}
+fires_train %>% group_by(intentional_cause) %>% count()
+```
+
+<br/>
+
+### What's the distribution of the fires according to the season?
+
+```{r}
+ggplot(fires_train, aes(x=season,fill= intentional_cause)) + geom_bar() +
+  ggtitle("Relationship between season and intentional cause")
+```
+##### As it was expected, most of the fires, intentional or unintentional, occured suring summer.
+
+<br/>
+
+### What's the distribution of the fires according to the weekday?
+```{r}
+ggplot(fires_train, aes(x=weekday,fill= intentional_cause)) + geom_bar() + 
+  ggtitle("Relationship between weekdays and intentional cause")
+```
+##### In this case, intentinal fires occur the most at Sundays, but unintentional occur the most during Saturdays.
+
+
+<br/>
+
+### What's the distribution of the fires according to the time of the day?
+
+```{r}
+ggplot(fires_train, aes(x=timeOfDay,fill= intentional_cause)) + geom_bar() + 
+  ggtitle("Relationship between time of day and intentional cause")
+```
+##### As we can see, the majority of the fires happen during afternoon and night, but the unintentional ones occur the most during the afternoon, but for the intentional ones, they're pretty much occur nearlly equally during the afternoon and night.
+
+<br/>
+
+### Could there be a relationship between "intentional_cause" and the maximum temperature?
+```{r}
+ggplot(fires_train, aes(x=tmax, fill= intentional_cause)) + geom_histogram(binwidth = 2) + 
+  ggtitle("Relationship between maximum temperature and intentional cause")
+
+```
+
+<br/>
+
+### Could there be a relationship between "intentional_cause" and the time it was alerted?
+```{r}
+ggplot(fires_train, aes(x=alert_hour, fill= intentional_cause)) + 
+  geom_histogram(binwidth = 3600) + 
+  scale_x_time()
+```
+##### The unintentional fires tend to happen the most between 10h and 22h, but it's clear that theres is a spike arround 15h. On the other hand, the intentional ones, also occur between 10h and 22h, but their count is way more even between these hours - they do not have a spike.
+
+
+<br/>
+
+### What can we say about the "origin" and the "intentional_cause"?
+```{r}
+fires_train %>% group_by(origin,intentional_cause) %>% count() %>% 
+  arrange(desc(n))
+```
+```{r}
+ggplot(fires_train, aes(x=origin, fill= intentional_cause)) + geom_bar()
+```
+
+##### We can see in the graph that the most fires with "intentional_cause" have origin "firepit".
+
+<br/>
+
+### What is the correlation coefficient between all numeric attributes?
+```{r}
+fires_train %>% select(tmax,village_area, farming_area, 
+                 vegetation_area) %>% cor()
+```
+
+
+### Is there any monotonic relationship?
+```{r}
+fires_train %>% select(tmax,village_area, farming_area, 
+                 vegetation_area) %>% cor(method = "spearman")
+```
+
+<br/>
+
+# Predictive Modeling
+
+```{r}
+fires_test <- read_csv("fires_test.csv", na=c("-","NA"))
+fires_test <- data_preprocessing(fires_test)
+```
+
+
+
+```{r}
+normalize <- function(x) {
+  return ((x - min(x,na.rm=TRUE)) / (max(x,na.rm=TRUE) - min(x,na.rm=TRUE)))
+}
+
+
+normalize_data <- function(dataset){
+  dataset <- dataset %>% 
+    mutate(tmax=normalize(tmax),
+           farming_area=normalize(farming_area),
+           village_area=normalize(village_area),
+           vegetation_area=normalize(vegetation_area)) %>% 
+    mutate(firepit=ifelse(origin=="firepit",1,0),
+           fire=ifelse(origin=="fire",1,0),
+           agriculture=ifelse(origin=="agriculture",1,0),
+           agric_burn=ifelse(origin=="agric_burn",1,0),
+           false_alarm=ifelse(origin=="false_alarm",1,0)) %>% 
+    mutate(winter=ifelse(season=="Winter",1,0),
+           spring=ifelse(season=="Spring",1,0),
+           summer=ifelse(season=="Summer",1,0),
+           fall=ifelse(season=="Fall",1,0)) %>%
+    mutate(Monday=ifelse(weekday=="Monday",1,0),
+           Tuesday=ifelse(weekday=="Tuesday",1,0),
+           Wednesday=ifelse(weekday=="Wednesday",1,0),
+           Thursday=ifelse(weekday=="Thursday",1,0),
+           Friday=ifelse(weekday=="Friday",1,0),
+           Saturday=ifelse(weekday=="Saturday",1,0),
+           Sunday=ifelse(weekday=="Sunday",1,0)) %>%
+    mutate(dawn=ifelse(timeOfDay=="dawn",1,0),
+           afternoon=ifelse(timeOfDay=="afternoon",1,0),
+           night=ifelse(timeOfDay=="night",1,0),
+           morning=ifelse(timeOfDay=="morning",1,0)) %>%
+    mutate(alert_date=gsub("[: -]","",alert_date),
+           alert_hour=gsub("[: -]","",alert_hour)) %>%
+    mutate(alert_date=normalize(as.numeric(alert_date)),
+           alert_hour=normalize(as.numeric(alert_hour))) %>%
+    select(-c(origin,season,weekday,timeOfDay))
+  return(dataset)
+}
+```
+
+```{r}
+id <- fires_test %>% select(id)
+fires_test <- fires_test %>% select(-id)
+fires_train <- fires_train %>% select(-id)
+fires_train_norm <- normalize_data(fires_train)
+fires_test_norm <- normalize_data(fires_test)
+fires_train_norm <- fires_train_norm %>% select(-district)
+fires_test_norm <- fires_test_norm %>% select(-district)
+```
+
+##### We are testing different models with normalized data and with not-normalized data, in order to find the best predictive model.
+
+```{r}
+res <- performanceEstimation(PredTask(intentional_cause ~ ., fires_train), 
+                             c(Workflow(learner = "naiveBayes"),   
+                               workflowVariants(learner = "rpart",
+                                                learner.pars = list(maxdepth = c(3,5)),
+                                                predictor.pars = list(type = "class")), 
+                               Workflow(learner = "rpart", predictor.pars = list(type = "class")),
+                               Workflow(learner = "randomForest", 
+                                        learner.pars = list(na.action=na.omit,importance=T)),
+                               Workflow(learner = "nnet", 
+                                        learner.pars = list(size = 5), 
+                                        predictor.pars = list(type = "class"))), 
+                             EstimationTask(metrics = c("acc", "F", "rec", "prec")))
+
+
+res_norm <- performanceEstimation(PredTask(intentional_cause ~ ., fires_train_norm), 
+                                  c(Workflow(learner = "naiveBayes"),   
+                                    workflowVariants(learner = "knn3", 
+                                                     learner.pars = list(k=c(3,5,7)), 
+                                                     predictor.pars = list(type = "class")),   
+                                    workflowVariants(learner = "rpart", 
+                                                     learner.pars = list(maxdepth = c(3,5)), 
+                                                     predictor.pars = list(type = "class")), 
+                                    Workflow(learner = "rpart", 
+                                             predictor.pars = list(type = "class")),
+                                    Workflow(learner = "randomForest", 
+                                             learner.pars = list(na.action=na.omit,importance=T)),
+                                    workflowVariants(learner = "svm", 
+                                                     learner.pars = list(kernel = "radial"), 
+                                                     predictor.pars = list(type = "class")),  
+                                    Workflow(learner = "nnet", 
+                                             learner.pars = list(size = 5), 
+                                             predictor.pars = list(type = "class"))), 
+                                  EstimationTask(metrics = c("acc", "F", "rec", "prec")))
+```
+
+```{r}
+rankWorkflows(res_norm, max = TRUE)
+rankWorkflows(res, max = TRUE)
+```
+
+##### We conclude that the model randomForest is the one that has better scores and results, so this is the one we're going with! Also note that the better results come with not-normalized data.
+
+<br/>
+
+##### Now we are evaluating which attributes can give us a better score.
+
+
+```{r}
+fires_train_eval <- fires_train
+# data-set completo
+a1 <- performanceEstimation(PredTask(intentional_cause ~ ., fires_train_eval), 
+                             c(Workflow(learner = "randomForest", 
+                                        learner.pars = list(na.action=na.omit, 
+                                                            importance=T))), 
+                             EstimationTask(metrics = c("acc", "F", "rec", "prec")))
+```
+```{r}
+summary(a1)
+```
+
+```{r}
+fires_train_eval <- fires_train %>% select(-timeOfDay)
+
+a2 <- performanceEstimation(PredTask(intentional_cause ~ ., fires_train_eval), 
+                             c(Workflow(learner = "randomForest", 
+                                        learner.pars = list(na.action=na.omit, 
+                                                            importance=T))), 
+                             EstimationTask(metrics = c("acc", "F", "rec", "prec")))
+```
+
+```{r}
+summary(a2)
+```
+
+```{r}
+fires_train_eval <- fires_train %>% select(-c(season,timeOfDay))
+# data-set completo
+a3 <- performanceEstimation(PredTask(intentional_cause ~ ., fires_train_eval), 
+                             c(Workflow(learner = "randomForest", 
+                                        learner.pars = list(na.action=na.omit, 
+                                                            importance=T))), 
+                             EstimationTask(metrics = c("acc", "F", "rec", "prec")))
+```
+```{r}
+summary(a3)
+```
+
+```{r}
+fires_train_eval <- fires_train %>% select(-c(inLitoral,timeOfDay))
+# data-set completo
+a4 <- performanceEstimation(PredTask(intentional_cause ~ ., fires_train_eval), 
+                             c(Workflow(learner = "randomForest", 
+                                        learner.pars = list(na.action=na.omit, 
+                                                            importance=T))), 
+                             EstimationTask(metrics = c("acc", "F", "rec", "prec")))
+```
+```{r}
+summary(a4)
+```
+
+```{r}
+fires_train_eval <- fires_train %>% select(-c(alert_date,timeOfDay))
+# data-set completo
+a5 <- performanceEstimation(PredTask(intentional_cause ~ ., fires_train_eval), 
+                             c(Workflow(learner = "randomForest", 
+                                        learner.pars = list(na.action=na.omit, 
+                                                            importance=T))), 
+                             EstimationTask(metrics = c("acc", "F", "rec", "prec")))
+```
+```{r}
+summary(a5)
+```
+
+```{r}
+fires_train_eval <- fires_train %>% select(-c(alert_hour,timeOfDay))
+# data-set completo
+a6 <- performanceEstimation(PredTask(intentional_cause ~ ., fires_train_eval), 
+                             c(Workflow(learner = "randomForest", 
+                                        learner.pars = list(na.action=na.omit, 
+                                                            importance=T))), 
+                             EstimationTask(metrics = c("acc", "F", "rec", "prec")))
+```
+```{r}
+summary(a6)
+```
+
+```{r}
+fires_train_eval <- fires_train %>% select(-c(timeOfDay,season,weekday,inLitoral))
+# data-set completo
+a7 <- performanceEstimation(PredTask(intentional_cause ~ ., fires_train_eval), 
+                             c(Workflow(learner = "randomForest", 
+                                        learner.pars = list(na.action=na.omit, 
+                                                            importance=T))), 
+                             EstimationTask(metrics = c("acc", "F", "rec", "prec")))
+```
+```{r}
+summary(a7)
+```
+
+```{r}
+fires_train_eval <- fires_train %>% select(-c(alert_hour,alert_date,district))
+# data-set completo
+a8 <- performanceEstimation(PredTask(intentional_cause ~ ., fires_train_eval), 
+                             c(Workflow(learner = "randomForest", 
+                                        learner.pars = list(na.action=na.omit, 
+                                                            importance=T))), 
+                             EstimationTask(metrics = c("acc", "F", "rec", "prec")))
+```
+```{r}
+summary(a8)
+```
+
+```{r}
+a <- mergeEstimationRes(a1,a2,a3,a4,a5,a6,a7,a8,by="workflows")
+rankWorkflows(a, max = TRUE)
+```
+
+<br/>
+
+##### After these resuts, we conclude that we have better scores if we remove "timeOfDay" from the final data-set.
+
+```{r}
+fires_train <- select(fires_train,-c(timeOfDay))
+fires_test <- select(fires_test,-c(timeOfDay))
+```
+```{r}
+randomForest_model <- randomForest(intentional_cause ~ ., fires_train)
+randomForest_preds <- predict(randomForest_model, fires_test)
+```
+
+<br/>
+##### Now we are creating the csv file to submit on Kaggle.
+```{r}
+result <- id %>% mutate(intentional_cause=randomForest_preds) %>% arrange(id)
+write.csv(result,file="result.csv",row.names = FALSE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
